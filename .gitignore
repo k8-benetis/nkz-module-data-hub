@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+.env
+.env.local
+.vscode/
+.idea/
+
+# Exclude all .md from repo (public); allow only README.md
+*.md
+!README.md

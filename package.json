@@ -1,0 +1,37 @@
+{
+  "name": "nkz-module-datahub",
+  "version": "1.0.0",
+  "description": "NKZ DataHub — Analytical canvas and data export module",
+  "license": "AGPL-3.0",
+  "type": "module",
+  "main": "./src/moduleEntry.ts",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "build:module": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@microsoft/fetch-event-source": "^2.0.1",
+    "@tanstack/react-query": "^5.0.0",
+    "apache-arrow": "^15.0.0",
+    "lucide-react": "^0.424.0",
+    "uplot": "^1.6.0"
+  },
+  "devDependencies": {
+    "@nekazari/module-builder": "file:../nkz/packages/module-builder",
+    "@nekazari/sdk": "^1.0.0",
+    "@nekazari/ui-kit": "^1.0.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.19",
+    "postcss": "^8.4.39",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwindcss": "^3.4.4",
+    "typescript": "^5.2.2",
+    "vite": "^5.3.1"
+  }
+}

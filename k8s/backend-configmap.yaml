@@ -1,0 +1,10 @@
+# ConfigMap for DataHub BFF — no secrets; use Secrets for S3 keys if needed.
+# PLATFORM_API_URL: empty here (no URLs in module repo). Production value is set via
+# GitOps overlay in the platform repo: nkz/gitops/overlays/datahub/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: datahub-api-config
+  namespace: nekazari
+data:
+  PLATFORM_API_URL: ""
