@@ -3,12 +3,27 @@
  * Uses same origin /api and token from host (Keycloak / __nekazariAuth).
  */
 
+/** A single timeseries attribute on a DataHub entity. */
+export interface DataHubEntityAttribute {
+  /** Attribute name as it appears in NGSI-LD (e.g. "ndviMean", "temperature"). */
+  name: string;
+  /**
+   * Data source for this specific attribute. Maps to the BFF adapter env var
+   * TIMESERIES_ADAPTER_{SOURCE}_URL (upper-cased). Examples:
+   *   "timescale"         → platform TimescaleDB (default)
+   *   "vegetation_health" → vegetation-health adapter (Arrow IPC)
+   *   "carbon"            → carbon module adapter
+   */
+  source: string;
+}
+
 export interface DataHubEntity {
   id: string;
   type: string;
   name: string;
-  attributes: string[];
-  /** Data source origin (e.g. timescale, odoo). Default from backend: timescale. */
+  /** Per-attribute source metadata. Each attribute routes to its own adapter. */
+  attributes: DataHubEntityAttribute[];
+  /** Entity-level default source (fallback when attribute has no explicit source). */
   source?: string;
 }
 
@@ -23,7 +38,7 @@ export function getAuthToken(): string | null {
   return w.keycloak?.token ?? w.__nekazariAuth?.token ?? null;
 }
 
-function getBaseUrl(): string {
+export function getBaseUrl(): string {
   if (typeof window === 'undefined') return '';
   const w = window as unknown as { __ENV__?: { VITE_API_URL?: string } };
   return w.__ENV__?.VITE_API_URL ?? '';
@@ -257,4 +272,59 @@ export async function requestExport(
   }
   const data = (await res.json()) as ExportParquetResponse;
   return { format: 'parquet', data };
+}
+
+// ---------------------------------------------------------------------------
+// Workspaces (Phase 5) — NGSI-LD DataHubWorkspace persist/load
+// ---------------------------------------------------------------------------
+
+export interface WorkspaceLayoutPanel {
+  panelId: string;
+  grid: { x: number; y: number; w: number; h: number };
+  type: 'timeseries_chart';
+  title?: string;
+  series: Array<{ entityId: string; attribute: string; source: string }>;
+}
+
+export interface DataHubWorkspacePayload {
+  id: string;
+  type: 'DataHubWorkspace';
+  name: { type: 'Property'; value: string };
+  timeContext: { type: 'Property'; value: { startTime: string; endTime: string; resolution: number } };
+  layout: { type: 'Property'; value: WorkspaceLayoutPanel[] };
+}
+
+export interface DataHubWorkspaceStored {
+  id: string;
+  type: string;
+  name?: { type: string; value: string };
+  timeContext?: { type: string; value: { startTime: string; endTime: string; resolution: number } };
+  layout?: { type: string; value: WorkspaceLayoutPanel[] };
+}
+
+/** POST /api/datahub/workspaces — create or update workspace (BFF → Context Broker). */
+export async function saveWorkspace(payload: DataHubWorkspacePayload): Promise<void> {
+  const base = getBaseUrl().replace(/\/$/, '');
+  const url = base ? `${base}/api/datahub/workspaces` : '/api/datahub/workspaces';
+  const token = getAuthToken();
+  const headers: HeadersInit = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+/** GET /api/datahub/workspaces — list workspaces for current tenant. */
+export async function listWorkspaces(): Promise<DataHubWorkspaceStored[]> {
+  const base = getBaseUrl().replace(/\/$/, '');
+  const path = '/api/datahub/workspaces';
+  const url = base ? `${base}${path}` : path;
+  const token = getAuthToken();
+  const headers: HeadersInit = { Accept: 'application/json' };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const res = await fetch(url, { headers });
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  return Array.isArray(data) ? data : data.workspaces ?? [];
 }

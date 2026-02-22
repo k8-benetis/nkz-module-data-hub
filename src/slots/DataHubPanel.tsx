@@ -12,6 +12,7 @@ import {
   requestExport,
   submitPredictJob,
   type DataHubEntity,
+  type DataHubEntityAttribute,
   type PredictionResult,
 } from '../services/datahubApi';
 
@@ -41,6 +42,15 @@ const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: 60
 
 const RESOLUTION = 1000;
 const BRUSH_DEBOUNCE_MS = 350;
+
+/** Attributes that are not numeric timeseries. The BFF already filters most of
+ *  these, but keep as a safety net for legacy entities. */
+const NON_TIMESERIES_ATTRIBUTES = new Set([
+  'location', 'type', 'name', 'id', '@context', 'dateCreated', 'dateModified', 'refParcel', 'seeAlso',
+  'ownedBy', 'category', 'description', 'address', 'area', 'landLocation',
+]);
+const timeseriesAttributes = (attrs: DataHubEntityAttribute[]) =>
+  attrs.filter((a) => !NON_TIMESERIES_ATTRIBUTES.has(a.name));
 
 /**
  * Matrix padding for uPlot: overlay prediction on historical without mutating original arrays.
@@ -151,18 +161,18 @@ const DataTree: React.FC<{
                   role="button"
                   tabIndex={0}
                   onClick={() => {
-                    const attr = e.attributes[0] ?? '';
-                    if (attr) {
-                      onSelect(e, attr);
-                      onAddToCanvas?.(e, attr);
+                    const firstAttr = timeseriesAttributes(e.attributes)[0];
+                    if (firstAttr) {
+                      onSelect(e, firstAttr.name);
+                      onAddToCanvas?.(e, firstAttr.name);
                     }
                   }}
                   onKeyDown={(ev) => {
                     if (ev.key === 'Enter' || ev.key === ' ') {
-                      const attr = e.attributes[0] ?? '';
-                      if (attr) {
-                        onSelect(e, attr);
-                        onAddToCanvas?.(e, attr);
+                      const firstAttr = timeseriesAttributes(e.attributes)[0];
+                      if (firstAttr) {
+                        onSelect(e, firstAttr.name);
+                        onAddToCanvas?.(e, firstAttr.name);
                       }
                     }
                   }}
@@ -175,32 +185,47 @@ const DataTree: React.FC<{
                   <span className="font-medium text-slate-800 dark:text-slate-200 truncate">{e.name}</span>
                   <span className="text-slate-500 shrink-0">{e.type}</span>
                 </div>
-                {selectedEntity?.id === e.id && e.attributes.length > 0 && (
+                {selectedEntity?.id === e.id && timeseriesAttributes(e.attributes).length > 0 && (
                   <ul className="pl-3 text-xs">
-                    {e.attributes.map((attr) => (
-                      <li
-                        key={attr}
-                        role="button"
-                        tabIndex={0}
-                        onClick={() => {
-                          onSelect(e, attr);
-                          onAddToCanvas?.(e, attr);
-                        }}
-                        onKeyDown={(ev) => {
-                          if (ev.key === 'Enter' || ev.key === ' ') {
-                            onSelect(e, attr);
-                            onAddToCanvas?.(e, attr);
-                          }
-                        }}
-                        className={`py-1 rounded px-1 cursor-pointer ${
-                          selectedAttribute === attr
-                            ? 'bg-slate-300 dark:bg-slate-500 text-slate-900 dark:text-slate-100'
-                            : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700/50'
-                        }`}
-                      >
-                        {attr}
-                      </li>
-                    ))}
+                    {timeseriesAttributes(e.attributes).map((attr) => {
+                      const handleDragStart = (ev: React.DragEvent<HTMLElement>) => {
+                        // Use per-attribute source so the BFF routes to the correct adapter.
+                        const payload = JSON.stringify({
+                          entityId: e.id,
+                          attribute: attr.name,
+                          source: attr.source,
+                          type: 'timeseries_chart',
+                        });
+                        ev.dataTransfer.setData('application/json', payload);
+                        ev.dataTransfer.effectAllowed = 'copy';
+                      };
+                      return (
+                        <li
+                          key={attr.name}
+                          role="button"
+                          tabIndex={0}
+                          draggable
+                          onDragStart={handleDragStart}
+                          onClick={() => {
+                            onSelect(e, attr.name);
+                            onAddToCanvas?.(e, attr.name);
+                          }}
+                          onKeyDown={(ev) => {
+                            if (ev.key === 'Enter' || ev.key === ' ') {
+                              onSelect(e, attr.name);
+                              onAddToCanvas?.(e, attr.name);
+                            }
+                          }}
+                          className={`py-1 rounded px-1 cursor-grab active:cursor-grabbing ${
+                            selectedAttribute === attr.name
+                              ? 'bg-slate-300 dark:bg-slate-500 text-slate-900 dark:text-slate-100'
+                              : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700/50'
+                          }`}
+                        >
+                          {attr.name}
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
               </li>
@@ -392,6 +417,9 @@ const DataHubPanelInner: React.FC = () => {
   };
 
   const handleAddToCanvas = useCallback((entity: DataHubEntity, attribute: string) => {
+    // Resolve the per-attribute source so the BFF routes to the correct adapter.
+    const attrDef = entity.attributes.find((a) => a.name === attribute);
+    const attrSource = attrDef?.source ?? entity.source ?? 'timescale';
     setCanvasSeries((prev) => {
       if (prev.some((s) => s.entityId === entity.id && s.attribute === attribute)) return prev;
       return [
@@ -400,7 +428,7 @@ const DataHubPanelInner: React.FC = () => {
           entityId: entity.id,
           attribute,
           label: `${entity.name} — ${attribute}`,
-          ...(entity.source && { source: entity.source }),
+          source: attrSource,
         },
       ];
     });

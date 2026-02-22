@@ -8,3 +8,7 @@ metadata:
   namespace: nekazari
 data:
   PLATFORM_API_URL: ""
+  # Vegetation-Health timeseries adapter for DataHub scatter-gather.
+  # Source name "vegetation_health" (underscore) matches this env var pattern.
+  # Production value set in nkz/gitops/overlays/datahub/configmap.yaml
+  TIMESERIES_ADAPTER_VEGETATION_HEALTH_URL: ""

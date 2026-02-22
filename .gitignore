@@ -10,3 +10,6 @@ dist/
 # Exclude all .md from repo (public); allow only README.md
 *.md
 !README.md
+
+# Repo docs (internal specs, reviews, API notes)
+docs/

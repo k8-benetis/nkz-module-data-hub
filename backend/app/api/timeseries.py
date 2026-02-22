@@ -1,13 +1,16 @@
 """
 Timeseries: transparent proxy (single-source) and hybrid alignment (multi-source).
 GET /data and POST /align with conditional routing: Route A = proxy to platform;
-Route B = fetch per-source /data, align in BFF with Polars join_asof, return Arrow IPC.
+Route B = Scatter-Gather by source: group by source, fetch one Arrow buffer per source
+(timescale = platform align or GET; external = POST to module export-arrow), then
+merge with Polars outer join on timestamp, output value_0, value_1, ...
 """
 
 import asyncio
 import io
 import os
 from typing import Any, Optional
+from urllib.parse import quote
 
 import httpx
 import pyarrow as pa
@@ -31,13 +34,43 @@ def _auth_headers(authorization: Optional[str], x_tenant_id: Optional[str]) -> d
     return h
 
 
+async def _resolve_timeseries_entity_id(
+    base_url: str,
+    entity_id: str,
+    headers: dict,
+) -> Optional[str]:
+    """
+    Resolve NGSI-LD URN to platform timeseries entity id (e.g. municipality_code).
+    Returns resolved id, or original entity_id for non-URNs / passthrough; None if 204/404.
+    """
+    if not base_url or not entity_id or not isinstance(entity_id, str):
+        return entity_id
+    eid = entity_id.strip()
+    if not eid.lower().startswith("urn:"):
+        return eid
+    path = quote(eid, safe="")
+    url = f"{base_url.rstrip('/')}/api/entities/{path}/timeseries-location"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(url, headers=headers)
+    if r.status_code == 200:
+        try:
+            body = r.json()
+            return body.get("timeseries_entity_id") or eid
+        except Exception:
+            return eid
+    return None
+
+
 def _get_adapter_base_url(source: str) -> Optional[str]:
-    """Adapter base URL for a given source. timescale uses PLATFORM_API_URL; others from env."""
+    """Adapter base URL for a given source. timescale uses PLATFORM_API_URL; others from env or http://{source}:8000."""
     s = (source or "timescale").strip().lower()
     if s == "timescale":
         return PLATFORM_API_URL or None
     key = f"TIMESERIES_ADAPTER_{s.upper()}_URL"
-    return (os.getenv(key) or "").rstrip("/") or None
+    url = (os.getenv(key) or "").rstrip("/")
+    if url:
+        return url
+    return f"http://{source}:8000"
 
 
 def _parse_arrow_stream(body: bytes) -> pa.Table:
@@ -188,6 +221,122 @@ async def _fetch_entity_data_raw(
     return r.content
 
 
+async def _fetch_from_timescale(
+    series_group: list[dict],
+    payload: dict,
+    headers: dict,
+) -> bytes:
+    """
+    Fetch one Arrow IPC buffer for a group of timescale series.
+    Single series: GET /api/timeseries/entities/{id}/data. Multiple: POST /api/timeseries/align.
+    """
+    base = PLATFORM_API_URL
+    if not base:
+        raise ValueError("PLATFORM_API_URL not configured")
+    start_time = payload["start_time"]
+    end_time = payload["end_time"]
+    resolution = int(payload.get("resolution", 1000))
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        if len(series_group) == 1:
+            s = series_group[0]
+            return await _fetch_entity_data_raw(
+                client, base, s["entity_id"], s["attribute"],
+                start_time, end_time, resolution, headers,
+            )
+        url = f"{base}/api/timeseries/align"
+        body = {
+            "start_time": start_time,
+            "end_time": end_time,
+            "resolution": min(max(resolution, 100), 10000),
+            "series": [{"entity_id": s["entity_id"], "attribute": s["attribute"]} for s in series_group],
+        }
+        r = await client.post(
+            url,
+            json=body,
+            headers={**headers, "Content-Type": "application/json", "Accept": ARROW_STREAM_TYPE},
+        )
+        r.raise_for_status()
+        return r.content
+
+
+async def _fetch_from_external_module(
+    source: str,
+    series_group: list[dict],
+    payload: dict,
+    authorization: Optional[str],
+) -> bytes:
+    """
+    POST to module internal export-arrow endpoint. Contract: POST /api/internal/timeseries/export-arrow
+    with body { series: [{ entity_id, attribute, source? }], start_time, end_time, resolution }.
+    """
+    base = _get_adapter_base_url(source)
+    if not base:
+        raise ValueError(f"No adapter URL for source: {source}")
+    url = f"{base.rstrip('/')}/api/internal/timeseries/export-arrow"
+    body = {
+        "series": [{"entity_id": s["entity_id"], "attribute": s["attribute"], "source": s.get("source", source)} for s in series_group],
+        "start_time": payload["start_time"],
+        "end_time": payload["end_time"],
+        "resolution": int(payload.get("resolution", 1000)),
+    }
+    headers: dict = {"Content-Type": "application/json", "Accept": ARROW_STREAM_TYPE}
+    if authorization:
+        headers["Authorization"] = authorization
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(url, json=body, headers=headers)
+        if r.status_code != 200:
+            raise RuntimeError(f"Module {source} returned {r.status_code}: {r.text[:500]}")
+        return r.content
+
+
+def _gather_arrow_to_aligned_df(arrow_bodies: list[bytes]) -> pl.DataFrame:
+    """
+    Read each Arrow IPC buffer into a DataFrame, outer-join on timestamp, flatten to value_0, value_1, ...
+    Each buffer may have columns [timestamp, value] or [timestamp, value_0, value_1, ...].
+    """
+    if not arrow_bodies:
+        raise ValueError("No Arrow buffers to merge")
+    dataframes: list[pl.DataFrame] = []
+    for raw in arrow_bodies:
+        try:
+            df = pl.read_ipc(io.BytesIO(raw))
+        except Exception as e:
+            raise ValueError(f"Invalid Arrow IPC: {e!s}") from e
+        if df.height == 0:
+            continue
+        if "timestamp" not in df.columns:
+            raise ValueError("Arrow table must have 'timestamp' column")
+        value_cols = [c for c in df.columns if c != "timestamp" and (c == "value" or c.startswith("value_"))]
+        if not value_cols:
+            raise ValueError("Arrow table must have at least one value column")
+        dataframes.append(df.select(["timestamp"] + value_cols))
+    if not dataframes:
+        raise ValueError("No non-empty DataFrames after parsing")
+    global_idx = 0
+    base = dataframes[0]
+    v0 = [c for c in base.columns if c != "timestamp"]
+    base = base.select(["timestamp"] + [pl.col(c).alias(f"value_{global_idx + i}") for i, c in enumerate(v0)])
+    global_idx += len(v0)
+    for next_df in dataframes[1:]:
+        vcols = [c for c in next_df.columns if c != "timestamp"]
+        next_renamed = next_df.select(
+            ["timestamp"] + [pl.col(c).alias(f"value_{global_idx + i}") for i, c in enumerate(vcols)],
+        )
+        base = base.join(next_renamed, on="timestamp", how="full", coalesce=True)
+        base = base.sort("timestamp")
+        global_idx += len(vcols)
+    return base.sort("timestamp")
+
+
+def _aligned_df_to_arrow_ipc_bytes(df: pl.DataFrame) -> bytes:
+    """Serialize aligned DataFrame (timestamp, value_0, value_1, ...) to Arrow IPC stream bytes."""
+    table = df.to_arrow()
+    sink = io.BytesIO()
+    with ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    return sink.getvalue()
+
+
 @router.post("/timeseries/align")
 async def proxy_timeseries_align(
     request: Request,
@@ -233,61 +382,83 @@ async def proxy_timeseries_align(
     sources = {s["source"] for s in series}
     single_timescale = sources == {"timescale"} and len(sources) == 1
 
-    # Route A: all series from timescale -> proxy to platform align (pure SQL)
+    # Route A: all series from timescale -> resolve URNs, then proxy to platform align
     if single_timescale and PLATFORM_API_URL:
+        headers = _auth_headers(authorization, x_tenant_id)
+        resolved_series: list[dict] = []
+        for s in series:
+            rid = await _resolve_timeseries_entity_id(PLATFORM_API_URL, s["entity_id"], headers)
+            if rid is None:
+                return JSONResponse(
+                    content={"error": f"Entity {s['entity_id']} has no timeseries location"},
+                    status_code=404,
+                )
+            resolved_series.append({"entity_id": rid, "attribute": s["attribute"]})
         url = f"{PLATFORM_API_URL}/api/timeseries/align"
-        headers = {"Content-Type": "application/json", **_auth_headers(authorization, x_tenant_id)}
+        req_headers = {"Content-Type": "application/json", **headers}
         proxy_body = {
             "start_time": start_time,
             "end_time": end_time,
             "resolution": min(max(resolution, 100), 10000),
-            "series": [{"entity_id": s["entity_id"], "attribute": s["attribute"]} for s in series],
+            "series": resolved_series,
         }
         async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(url, json=proxy_body, headers=headers)
-            r.raise_for_status()
+            r = await client.post(url, json=proxy_body, headers=req_headers)
+        if r.status_code >= 400:
+            try:
+                body = r.json()
+            except Exception:
+                body = {"error": r.text or f"Upstream {r.status_code}"}
+            return JSONResponse(content=body, status_code=r.status_code)
         return Response(content=r.content, media_type=ARROW_STREAM_TYPE)
 
-    # Route B: fetch Arrow bytes per series, then offload Polars (join_asof) to thread pool
+    # Route B: Scatter-Gather by source — group by source, one Arrow buffer per source, then merge with Polars
     resolution = min(max(resolution, 100), 10000)
-    try:
-        from datetime import datetime
-        start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-        end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
-    except Exception:
-        return JSONResponse(content={"error": "Invalid start_time or end_time format"}, status_code=400)
-    start_ts = start_dt.timestamp()
-    end_ts = end_dt.timestamp()
-    if start_ts >= end_ts:
-        return JSONResponse(content={"error": "start_time must be before end_time"}, status_code=400)
-
     headers = _auth_headers(authorization, x_tenant_id)
+    resolved_series_align = list(series)
+    if PLATFORM_API_URL:
+        for i, s in enumerate(resolved_series_align):
+            if (s.get("source") or "timescale").strip().lower() == "timescale":
+                rid = await _resolve_timeseries_entity_id(PLATFORM_API_URL, s["entity_id"], headers)
+                if rid is not None:
+                    resolved_series_align[i] = {**s, "entity_id": rid}
 
-    async def fetch_one(idx: int, s: dict) -> tuple[int, bytes]:
-        base = _get_adapter_base_url(s["source"])
-        if not base:
-            raise ValueError(f"No adapter URL for source: {s['source']}")
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            raw = await _fetch_entity_data_raw(
-                client, base, s["entity_id"], s["attribute"],
-                start_time, end_time, resolution, headers,
+    payload = {"start_time": start_time, "end_time": end_time, "resolution": resolution}
+    sources_map: dict[str, list[dict]] = {}
+    for s in resolved_series_align:
+        src = (s.get("source") or "timescale").strip().lower() or "timescale"
+        sources_map.setdefault(src, []).append(s)
+
+    tasks: list[asyncio.Task] = []
+    task_sources: list[str] = []
+    for source, group in sources_map.items():
+        task_sources.append(source)
+        if source == "timescale":
+            tasks.append(asyncio.create_task(_fetch_from_timescale(group, payload, headers)))
+        else:
+            tasks.append(
+                asyncio.create_task(_fetch_from_external_module(source, group, payload, authorization)),
             )
-        return idx, raw
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    arrow_bodies: list[bytes] = []
+    for source, res in zip(task_sources, results):
+        if isinstance(res, Exception):
+            return JSONResponse(
+                content={"error": f"Error obteniendo datos de {source}: {res!s}"},
+                status_code=502,
+            )
+        arrow_bodies.append(res)
+
+    if not arrow_bodies:
+        return JSONResponse(content={"error": "No se obtuvieron datos de ningún origen"}, status_code=400)
 
     try:
-        results = await asyncio.gather(*[fetch_one(i, s) for i, s in enumerate(series)])
-    except Exception as e:
-        return JSONResponse(content={"error": f"Adapter fetch failed: {e!s}"}, status_code=502)
+        aligned_df = await asyncio.to_thread(_gather_arrow_to_aligned_df, arrow_bodies)
+        result_bytes = await asyncio.to_thread(_aligned_df_to_arrow_ipc_bytes, aligned_df)
+    except ValueError as e:
+        return JSONResponse(content={"error": str(e)}, status_code=502)
 
-    results.sort(key=lambda x: x[0])
-    arrow_bodies = [b for _, b in results]
-    result_bytes = await asyncio.to_thread(
-        _align_multi_source_to_arrow_ipc_sync,
-        arrow_bodies,
-        start_ts,
-        end_ts,
-        resolution,
-    )
     return Response(
         content=result_bytes,
         media_type=ARROW_STREAM_TYPE,
@@ -304,7 +475,8 @@ async def proxy_timeseries_data(
 ):
     """
     Transparent proxy to platform GET /api/timeseries/entities/<id>/data.
-    Forwards query string and auth headers; streams response body (no parse).
+    Resolves NGSI-LD URNs to timeseries entity id (municipality_code) via platform
+    /api/entities/{id}/timeseries-location, then forwards query string and auth.
     """
     if not PLATFORM_API_URL:
         return JSONResponse(
@@ -312,14 +484,23 @@ async def proxy_timeseries_data(
             status_code=503,
         )
 
-    url = f"{PLATFORM_API_URL}/api/timeseries/entities/{entity_id}/data"
     headers = _auth_headers(authorization, x_tenant_id)
+    resolved_id = await _resolve_timeseries_entity_id(PLATFORM_API_URL, entity_id, headers)
+    if resolved_id is None:
+        return Response(content=b"", status_code=204)
+
+    url = f"{PLATFORM_API_URL}/api/timeseries/entities/{resolved_id}/data"
     params = dict(request.query_params)
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         r = await client.get(url, params=params, headers=headers or None)
-        r.raise_for_status()
         content_type = r.headers.get("content-type", "application/octet-stream")
+        if r.status_code >= 400:
+            try:
+                body = r.json()
+            except Exception:
+                body = {"error": r.text or f"Upstream {r.status_code}"}
+            return JSONResponse(content=body, status_code=r.status_code)
         return Response(content=r.content, media_type=content_type)
 
 
@@ -384,25 +565,35 @@ async def proxy_export(
     sources = {s["source"] for s in series}
     single_timescale = sources == {"timescale"} and len(sources) == 1
 
-    # Route A: single source timescale -> proxy to platform
+    # Route A: single source timescale -> resolve URNs, then proxy to platform
     if single_timescale and PLATFORM_API_URL:
+        headers = _auth_headers(authorization, x_tenant_id)
+        resolved_export: list[dict] = []
+        for s in series:
+            rid = await _resolve_timeseries_entity_id(PLATFORM_API_URL, s["entity_id"], headers)
+            if rid is None:
+                return JSONResponse(
+                    content={"error": f"Entity {s['entity_id']} has no timeseries location"},
+                    status_code=404,
+                )
+            resolved_export.append({"entity_id": rid, "attribute": s["attribute"]})
         url = f"{PLATFORM_API_URL}/api/timeseries/export"
-        headers = {"Content-Type": "application/json", **_auth_headers(authorization, x_tenant_id)}
+        req_headers = {"Content-Type": "application/json", **headers}
         proxy_body = {
             "start_time": start_time,
             "end_time": end_time,
-            "series": [{"entity_id": s["entity_id"], "attribute": s["attribute"]} for s in series],
+            "series": resolved_export,
             "format": fmt,
             "aggregation": aggregation,
         }
         async with httpx.AsyncClient(timeout=120.0) as client:
-            r = await client.post(url, json=proxy_body, headers=headers)
+            r = await client.post(url, json=proxy_body, headers=req_headers)
             r.raise_for_status()
         if r.headers.get("content-type", "").startswith("text/csv"):
             return Response(content=r.content, media_type="text/csv", headers=dict(r.headers))
         return JSONResponse(content=r.json())
 
-    # Route B: multi-source or non-timescale -> BFF orchestrates: fetch, align in thread, then CSV or Parquet
+    # Route B: resolve URNs for timescale, then fetch, align in thread, CSV or Parquet
     try:
         from datetime import datetime
         start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
@@ -415,8 +606,15 @@ async def proxy_export(
         return JSONResponse(content={"error": "start_time must be before end_time"}, status_code=400)
     resolution = _resolution_from_aggregation(start_ts, end_ts, aggregation)
     headers = _auth_headers(authorization, x_tenant_id)
+    resolved_series_export = list(series)
+    if PLATFORM_API_URL:
+        for i, s in enumerate(resolved_series_export):
+            if (s.get("source") or "timescale").strip().lower() == "timescale":
+                rid = await _resolve_timeseries_entity_id(PLATFORM_API_URL, s["entity_id"], headers)
+                if rid is not None:
+                    resolved_series_export[i] = {**s, "entity_id": rid}
 
-    async def fetch_one(idx: int, s: dict) -> tuple[int, bytes]:
+    async def fetch_one_export(idx: int, s: dict) -> tuple[int, bytes]:
         base = _get_adapter_base_url(s["source"])
         if not base:
             raise ValueError(f"No adapter URL for source: {s['source']}")
@@ -428,7 +626,7 @@ async def proxy_export(
         return idx, raw
 
     try:
-        results = await asyncio.gather(*[fetch_one(i, s) for i, s in enumerate(series)])
+        results = await asyncio.gather(*[fetch_one_export(i, s) for i, s in enumerate(resolved_series_export)])
     except Exception as e:
         return JSONResponse(content={"error": f"Adapter fetch failed: {e!s}"}, status_code=502)
 

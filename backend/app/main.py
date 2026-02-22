@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.entities import router as entities_router
 from app.api.timeseries import router as timeseries_router
+from app.api.workspaces import router as workspaces_router
 
 app = FastAPI(
     title="DataHub BFF",
@@ -25,6 +26,7 @@ app.add_middleware(
 
 app.include_router(entities_router)
 app.include_router(timeseries_router)
+app.include_router(workspaces_router)
 
 
 @app.get("/health")
