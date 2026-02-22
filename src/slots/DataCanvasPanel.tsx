@@ -7,7 +7,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 
-import ArrowWorker from '../workers/arrow-decoder.worker?worker';
+import ArrowWorker from '../workers/arrow-decoder.worker?worker&inline';
 import { useUPlotCesiumSync } from '../hooks/useUPlotCesiumSync';
 import { getAuthToken, getBaseUrl } from '../services/datahubApi';
 import type { ChartSeriesDef, PredictionPayload } from '../types/dashboard';
